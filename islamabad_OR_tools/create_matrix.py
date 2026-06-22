@@ -1,13 +1,36 @@
 import xgboost as xgb
 import pandas as pd
+import requests
+import datetime
 from ortools.constraint_solver import pywrapcp
 from ortools.constraint_solver import routing_enums_pb2
 
-# 1. The Matrix Generator
-def create_time_matrix(distance_matrix, model):
+# 1. The Live Sensor
+def get_live_conditions():
+    print("📡 Fetching live data for Islamabad...")
+    now = datetime.datetime.now()
+    hour_of_day = now.hour
+    day_of_week = now.weekday() 
+
+    url = "https://api.open-meteo.com/v1/forecast?latitude=33.6844&longitude=73.0479&current=precipitation"
+    try:
+        response = requests.get(url)
+        data = response.json()
+        precipitation = data['current']['precipitation']
+        is_raining = 1 if precipitation > 0 else 0
+    except Exception:
+        print("⚠️ Failed to get weather. Defaulting to clear.")
+        is_raining = 0
+
+    print(f"-> Conditions: Hour {hour_of_day}, Day {day_of_week}, Raining: {'Yes' if is_raining else 'No'}")
+    return hour_of_day, day_of_week, is_raining
+
+# 2. The AI Matrix Generator (Now accepts LIVE data)
+def create_time_matrix(distance_matrix, model, live_hour, live_day, live_rain):
     num_locations = len(distance_matrix)
     time_matrix = [[0.0] * num_locations for _ in range(num_locations)]
-    print("AI is pre-calculating the Time Matrix...")
+    print("\n🧠 AI is pre-calculating ETAs based on LIVE conditions...")
+    
     for i in range(num_locations):
         for j in range(num_locations):
             if i == j:
@@ -15,11 +38,11 @@ def create_time_matrix(distance_matrix, model):
             else:
                 features = pd.DataFrame([{
                     'distance_km': distance_matrix[i][j],
-                    'hour_of_day': 18,        # 6 PM Rush Hour!
-                    'day_of_week': 0,         # Monday
-                    'is_raining': 1,          # Raining!
-                    'road_qualities': 0,      # Bad Roads
-                    'congestion_levels': 5,   # Heavy Traffic
+                    'hour_of_day': live_hour,      # LIVE!
+                    'day_of_week': live_day,       # LIVE!
+                    'is_raining': live_rain,       # LIVE!
+                    'road_qualities': 1,           # Normal roads
+                    'congestion_levels': 3,        # Moderate traffic
                     'type_of_road': 0,
                     'checkpoints': 1
                 }])
@@ -27,11 +50,14 @@ def create_time_matrix(distance_matrix, model):
     return time_matrix
 
 def main():
-    # 2. Setup the Data
+    # Fetch live data first
+    live_hour, live_day, live_rain = get_live_conditions()
+
+    # Load Brain
     model = xgb.XGBRegressor()
     model.load_model('islamabad_traffic_model.json')
     
-    # 5 locations in Islamabad (e.g., NUST, G-11, I-8, F-7, DHA)
+    # Distance Matrix
     distance_matrix = [
         [0.0, 5.2, 8.1, 12.5, 15.0],
         [5.2, 0.0, 3.4, 9.8, 11.2],
@@ -40,42 +66,30 @@ def main():
         [15.0, 11.2, 8.5, 4.1, 0.0]
     ]
     
-    time_matrix = create_time_matrix(distance_matrix, model)
-    num_vehicles = 1
-    depot = 0 # Starting at NUST
-
-    # 3. Setup OR-Tools
-    manager = pywrapcp.RoutingIndexManager(len(time_matrix), num_vehicles, depot)
+    # Generate Matrix with Live Data
+    time_matrix = create_time_matrix(distance_matrix, model, live_hour, live_day, live_rain)
+    
+    # Setup OR-Tools
+    manager = pywrapcp.RoutingIndexManager(len(time_matrix), 1, 0)
     routing = pywrapcp.RoutingModel(manager)
 
-    # ==========================================
-    # THE FUSION CALLBACK
     def time_callback(from_index, to_index):
-        # 1. Convert routing indices to matrix indices
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
-        
-        # 2. Look up the AI's predicted minutes in time_matrix
-        predicted_minutes = time_matrix[from_node][to_node]
-        
-        # 3. Convert minutes to seconds (multiply by 60) and cast to integer
-        return int(predicted_minutes * 60)
-    # ==========================================
+        return int(time_matrix[from_node][to_node] * 60)
 
     transit_callback_index = routing.RegisterTransitCallback(time_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    # 4. Solve the Route
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
+    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
 
-    print("\nOR-Tools is calculating the fastest route using AI predictions...")
+    print("🚚 OR-Tools is solving the route...")
     solution = routing.SolveWithParameters(search_parameters)
 
-    # 5. Print the Results
+    # Print Results
     if solution:
-        print("\n--- OPTIMAL ROUTE FOUND ---")
+        print("\n--- OPTIMAL LIVE ROUTE FOUND ---")
         index = routing.Start(0)
         plan_output = 'Route:\n'
         route_time_seconds = 0
@@ -89,9 +103,6 @@ def main():
         plan_output += f'Location {manager.IndexToNode(index)}\n'
         plan_output += f'Total ETA: {round(route_time_seconds / 60, 1)} minutes'
         print(plan_output)
-    else:
-        print("No solution found!")
 
 if __name__ == "__main__":
     main()
-
